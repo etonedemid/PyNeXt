@@ -1,112 +1,53 @@
-
-/* Thread package.
-   This is intended to be usable independently from Python.
-   The implementation for system foobar is in a file thread_foobar.h
-   which is included by this file dependent on config settings.
-   Stuff shared by all thread_*.h files is collected here. */
+/* Thread package for Nintendo Switch port of CPython 3.14.
+   Based on Python-3.14.6/Python/thread.c with SWITCH platform support added. */
 
 #include "Python.h"
-
-#ifndef _POSIX_THREADS
-/* This means pthreads are not implemented in libc headers, hence the macro
-   not present in unistd.h. But they still can be implemented as an external
-   library (e.g. gnu pth in pthread emulation) */
-# ifdef HAVE_PTHREAD_H
-#  include <pthread.h> /* _POSIX_THREADS */
-# endif
-#endif
+#include "pycore_ceval.h"         // _PyEval_MakePendingCalls()
+#include "pycore_pystate.h"       // _PyInterpreterState_GET()
+#include "pycore_runtime.h"       // _PyRuntime
+#include "pycore_structseq.h"     // _PyStructSequence_FiniBuiltin()
 
 #ifndef DONT_HAVE_STDIO_H
-#include <stdio.h>
+#  include <stdio.h>
 #endif
 
 #include <stdlib.h>
 
-#include "pythread.h"
 
-#ifndef _POSIX_THREADS
+// Define PY_TIMEOUT_MAX constant for Switch.
+#define PY_TIMEOUT_MAX_VALUE LLONG_MAX
+const long long PY_TIMEOUT_MAX = PY_TIMEOUT_MAX_VALUE;
 
-/* Check if we're running on HP-UX and _SC_THREADS is defined. If so, then
-   enough of the Posix threads package is implemented to support python
-   threads.
-
-   This is valid for HP-UX 11.23 running on an ia64 system. If needed, add
-   a check of __ia64 to verify that we're running on an ia64 system instead
-   of a pa-risc system.
-*/
-#ifdef __hpux
-#ifdef _SC_THREADS
-#define _POSIX_THREADS
-#endif
-#endif
-
-#endif /* _POSIX_THREADS */
-
-
-#ifdef Py_DEBUG
-static int thread_debug = 0;
-#define dprintf(args)   (void)((thread_debug & 1) && printf args)
-#define d2printf(args)  ((thread_debug & 8) && printf args)
-#else
-#define dprintf(args)
-#define d2printf(args)
-#endif
-
-static int initialized;
 
 static void PyThread__init_thread(void); /* Forward */
+
+#define initialized _PyRuntime.threads.initialized
 
 void
 PyThread_init_thread(void)
 {
-#ifdef Py_DEBUG
-    char *p = Py_GETENV("PYTHONTHREADDEBUG");
-
-    if (p) {
-        if (*p)
-            thread_debug = atoi(p);
-        else
-            thread_debug = 1;
-    }
-#endif /* Py_DEBUG */
-    if (initialized)
+    if (initialized) {
         return;
+    }
     initialized = 1;
-    dprintf(("PyThread_init_thread called\n"));
     PyThread__init_thread();
 }
 
-/* Support for runtime thread stack size tuning.
-   A value of 0 means using the platform's default stack size
-   or the size specified by the THREAD_STACK_SIZE macro. */
-static size_t _pythread_stacksize = 0;
 
-#ifdef _POSIX_THREADS
-#define PYTHREAD_NAME "pthread"
-#include "thread_pthread.h"
-#endif
-
-#ifdef NT_THREADS
-#define PYTHREAD_NAME "nt"
-#include "thread_nt.h"
-#endif
-
+/* Switch-specific thread implementation */
 #ifdef SWITCH
-#define PYTHREAD_NAME "nx"
-#include "thread_nx.h"
+#   define PYTHREAD_NAME "nx"
+#   include "thread_nx.h"
+#else
+#   error "Require native threads. See https://bugs.python.org/issue31370"
 #endif
 
-/*
-#ifdef FOOBAR_THREADS
-#include "thread_foobar.h"
-#endif
-*/
 
 /* return the current thread stack size */
 size_t
 PyThread_get_stacksize(void)
 {
-    return _pythread_stacksize;
+    return _PyInterpreterState_GET()->threads.stacksize;
 }
 
 /* Only platforms defining a THREAD_SET_STACKSIZE() macro
@@ -124,253 +65,124 @@ PyThread_set_stacksize(size_t size)
 #endif
 }
 
-#ifndef Py_HAVE_NATIVE_TLS
-/* If the platform has not supplied a platform specific
-   TLS implementation, provide our own.
-
-   This code stolen from "thread_sgi.h", where it was the only
-   implementation of an existing Python TLS API.
-*/
-/* ------------------------------------------------------------------------
-Per-thread data ("key") support.
-
-Use PyThread_create_key() to create a new key.  This is typically shared
-across threads.
-
-Use PyThread_set_key_value(thekey, value) to associate void* value with
-thekey in the current thread.  Each thread has a distinct mapping of thekey
-to a void* value.  Caution:  if the current thread already has a mapping
-for thekey, value is ignored.
-
-Use PyThread_get_key_value(thekey) to retrieve the void* value associated
-with thekey in the current thread.  This returns NULL if no value is
-associated with thekey in the current thread.
-
-Use PyThread_delete_key_value(thekey) to forget the current thread's associated
-value for thekey.  PyThread_delete_key(thekey) forgets the values associated
-with thekey across *all* threads.
-
-While some of these functions have error-return values, none set any
-Python exception.
-
-None of the functions does memory management on behalf of the void* values.
-You need to allocate and deallocate them yourself.  If the void* values
-happen to be PyObject*, these functions don't do refcount operations on
-them either.
-
-The GIL does not need to be held when calling these functions; they supply
-their own locking.  This isn't true of PyThread_create_key(), though (see
-next paragraph).
-
-There's a hidden assumption that PyThread_create_key() will be called before
-any of the other functions are called.  There's also a hidden assumption
-that calls to PyThread_create_key() are serialized externally.
------------------------------------------------------------------------- */
-
-/* A singly-linked list of struct key objects remembers all the key->value
- * associations.  File static keyhead heads the list.  keymutex is used
- * to enforce exclusion internally.
- */
-struct key {
-    /* Next record in the list, or NULL if this is the last record. */
-    struct key *next;
-
-    /* The thread id, according to PyThread_get_thread_ident(). */
-    long id;
-
-    /* The key and its associated value. */
-    int key;
-    void *value;
-};
-
-static struct key *keyhead = NULL;
-static PyThread_type_lock keymutex = NULL;
-static int nkeys = 0;  /* PyThread_create_key() hands out nkeys+1 next */
-
-/* Internal helper.
- * If the current thread has a mapping for key, the appropriate struct key*
- * is returned.  NB:  value is ignored in this case!
- * If there is no mapping for key in the current thread, then:
- *     If value is NULL, NULL is returned.
- *     Else a mapping of key to value is created for the current thread,
- *     and a pointer to a new struct key* is returned; except that if
- *     malloc() can't find room for a new struct key*, NULL is returned.
- * So when value==NULL, this acts like a pure lookup routine, and when
- * value!=NULL, this acts like dict.setdefault(), returning an existing
- * mapping if one exists, else creating a new mapping.
- *
- * Caution:  this used to be too clever, trying to hold keymutex only
- * around the "p->next = keyhead; keyhead = p" pair.  That allowed
- * another thread to mutate the list, via key deletion, concurrent with
- * find_key() crawling over the list.  Hilarity ensued.  For example, when
- * the for-loop here does "p = p->next", p could end up pointing at a
- * record that PyThread_delete_key_value() was concurrently free()'ing.
- * That could lead to anything, from failing to find a key that exists, to
- * segfaults.  Now we lock the whole routine.
- */
-static struct key *
-find_key(int set_value, int key, void *value)
-{
-    struct key *p, *prev_p;
-    long id = PyThread_get_thread_ident();
-
-    if (!keymutex)
-        return NULL;
-    PyThread_acquire_lock(keymutex, 1);
-    prev_p = NULL;
-    for (p = keyhead; p != NULL; p = p->next) {
-        if (p->id == id && p->key == key) {
-            if (set_value)
-                p->value = value;
-            goto Done;
-        }
-        /* Sanity check.  These states should never happen but if
-         * they do we must abort.  Otherwise we'll end up spinning
-         * in a tight loop with the lock held.  A similar check is done
-         * in pystate.c tstate_delete_common().  */
-        if (p == prev_p)
-            Py_FatalError("tls find_key: small circular list(!)");
-        prev_p = p;
-        if (p->next == keyhead)
-            Py_FatalError("tls find_key: circular list(!)");
-    }
-    if (!set_value && value == NULL) {
-        assert(p == NULL);
-        goto Done;
-    }
-    p = (struct key *)PyMem_RawMalloc(sizeof(struct key));
-    if (p != NULL) {
-        p->id = id;
-        p->key = key;
-        p->value = value;
-        p->next = keyhead;
-        keyhead = p;
-    }
- Done:
-    PyThread_release_lock(keymutex);
-    return p;
-}
-
-/* Return a new key.  This must be called before any other functions in
- * this family, and callers must arrange to serialize calls to this
- * function.  No violations are detected.
- */
-int
-PyThread_create_key(void)
-{
-    /* All parts of this function are wrong if it's called by multiple
-     * threads simultaneously.
-     */
-    if (keymutex == NULL)
-        keymutex = PyThread_allocate_lock();
-    return ++nkeys;
-}
-
-/* Forget the associations for key across *all* threads. */
-void
-PyThread_delete_key(int key)
-{
-    struct key *p, **q;
-
-    PyThread_acquire_lock(keymutex, 1);
-    q = &keyhead;
-    while ((p = *q) != NULL) {
-        if (p->key == key) {
-            *q = p->next;
-            PyMem_RawFree((void *)p);
-            /* NB This does *not* free p->value! */
-        }
-        else
-            q = &p->next;
-    }
-    PyThread_release_lock(keymutex);
-}
 
 int
-PyThread_set_key_value(int key, void *value)
+PyThread_ParseTimeoutArg(PyObject *arg, int blocking, PY_TIMEOUT_T *timeout_p)
 {
-    struct key *p;
-
-    p = find_key(1, key, value);
-    if (p == NULL)
-        return -1;
-    else
+    assert(_PyTime_FromSeconds(-1) == PyThread_UNSET_TIMEOUT);
+    if (arg == NULL || arg == Py_None) {
+        *timeout_p = blocking ? PyThread_UNSET_TIMEOUT : 0;
         return 0;
+    }
+    if (!blocking) {
+        PyErr_SetString(PyExc_ValueError,
+                        "can't specify a timeout for a non-blocking call");
+        return -1;
+    }
+
+    PyTime_t timeout;
+    if (_PyTime_FromSecondsObject(&timeout, arg, _PyTime_ROUND_TIMEOUT) < 0) {
+        return -1;
+    }
+    if (timeout < 0) {
+        PyErr_SetString(PyExc_ValueError,
+                        "timeout value must be a non-negative number");
+        return -1;
+    }
+
+    if (_PyTime_AsMicroseconds(timeout,
+                               _PyTime_ROUND_TIMEOUT) > PY_TIMEOUT_MAX) {
+        PyErr_SetString(PyExc_OverflowError,
+                        "timeout value is too large");
+        return -1;
+    }
+    *timeout_p = timeout;
+    return 0;
 }
 
-/* Retrieve the value associated with key in the current thread, or NULL
- * if the current thread doesn't have an association for key.
- */
-void *
-PyThread_get_key_value(int key)
+PyLockStatus
+PyThread_acquire_lock_timed_with_retries(PyThread_type_lock lock,
+                                         PY_TIMEOUT_T timeout)
 {
-    struct key *p = find_key(0, key, NULL);
+    PyThreadState *tstate = _PyThreadState_GET();
+    PyTime_t endtime = 0;
+    if (timeout > 0) {
+        endtime = _PyDeadline_Init(timeout);
+    }
 
-    if (p == NULL)
+    PyLockStatus r;
+    do {
+        PyTime_t microseconds;
+        microseconds = _PyTime_AsMicroseconds(timeout, _PyTime_ROUND_CEILING);
+
+        /* first a simple non-blocking try without releasing the GIL */
+        r = PyThread_acquire_lock_timed(lock, 0, 0);
+        if (r == PY_LOCK_FAILURE && microseconds != 0) {
+            Py_BEGIN_ALLOW_THREADS
+            r = PyThread_acquire_lock_timed(lock, microseconds, 1);
+            Py_END_ALLOW_THREADS
+        }
+
+        if (r == PY_LOCK_INTR) {
+            /* Run signal handlers if we were interrupted. */
+            if (_PyEval_MakePendingCalls(tstate) < 0) {
+                return PY_LOCK_INTR;
+            }
+
+            /* If we're using a timeout, recompute the timeout after processing
+             * signals, since those can take time. */
+            if (timeout > 0) {
+                timeout = _PyDeadline_Get(endtime);
+
+                /* Check for negative values, since those mean block forever. */
+                if (timeout < 0) {
+                    r = PY_LOCK_FAILURE;
+                }
+            }
+        }
+    } while (r == PY_LOCK_INTR);  /* Retry if we were interrupted. */
+
+    return r;
+}
+
+
+/* Thread Specific Storage (TSS) API
+
+   Cross-platform components of TSS API implementation.
+*/
+
+Py_tss_t *
+PyThread_tss_alloc(void)
+{
+    Py_tss_t *new_key = (Py_tss_t *)PyMem_RawMalloc(sizeof(Py_tss_t));
+    if (new_key == NULL) {
         return NULL;
-    else
-        return p->value;
-}
-
-/* Forget the current thread's association for key, if any. */
-void
-PyThread_delete_key_value(int key)
-{
-    long id = PyThread_get_thread_ident();
-    struct key *p, **q;
-
-    PyThread_acquire_lock(keymutex, 1);
-    q = &keyhead;
-    while ((p = *q) != NULL) {
-        if (p->key == key && p->id == id) {
-            *q = p->next;
-            PyMem_RawFree((void *)p);
-            /* NB This does *not* free p->value! */
-            break;
-        }
-        else
-            q = &p->next;
     }
-    PyThread_release_lock(keymutex);
+    new_key->_is_initialized = 0;
+    return new_key;
 }
 
-/* Forget everything not associated with the current thread id.
- * This function is called from PyOS_AfterFork().  It is necessary
- * because other thread ids which were in use at the time of the fork
- * may be reused for new threads created in the forked process.
- */
 void
-PyThread_ReInitTLS(void)
+PyThread_tss_free(Py_tss_t *key)
 {
-    long id = PyThread_get_thread_ident();
-    struct key *p, **q;
-
-    if (!keymutex)
-        return;
-
-    /* As with interpreter_lock in PyEval_ReInitThreads()
-       we just create a new lock without freeing the old one */
-    keymutex = PyThread_allocate_lock();
-
-    /* Delete all keys which do not match the current thread id */
-    q = &keyhead;
-    while ((p = *q) != NULL) {
-        if (p->id != id) {
-            *q = p->next;
-            PyMem_RawFree((void *)p);
-            /* NB This does *not* free p->value! */
-        }
-        else
-            q = &p->next;
+    if (key != NULL) {
+        PyThread_tss_delete(key);
+        PyMem_RawFree((void *)key);
     }
 }
 
-#endif /* Py_HAVE_NATIVE_TLS */
+int
+PyThread_tss_is_created(Py_tss_t *key)
+{
+    assert(key != NULL);
+    return key->_is_initialized;
+}
+
 
 PyDoc_STRVAR(threadinfo__doc__,
 "sys.thread_info\n\
 \n\
-A struct sequence holding information about the thread implementation.");
+A named tuple holding information about the thread implementation.");
 
 static PyStructSequence_Field threadinfo_fields[] = {
     {"name",    "name of the thread implementation"},
@@ -393,15 +205,10 @@ PyThread_GetInfo(void)
 {
     PyObject *threadinfo, *value;
     int pos = 0;
-#if (defined(_POSIX_THREADS) && defined(HAVE_CONFSTR) \
-     && defined(_CS_GNU_LIBPTHREAD_VERSION))
-    char buffer[255];
-    int len;
-#endif
 
-    if (ThreadInfoType.tp_name == 0) {
-        if (PyStructSequence_InitType2(&ThreadInfoType, &threadinfo_desc) < 0)
-            return NULL;
+    PyInterpreterState *interp = _PyInterpreterState_GET();
+    if (_PyStructSequence_InitBuiltin(interp, &ThreadInfoType, &threadinfo_desc) < 0) {
+        return NULL;
     }
 
     threadinfo = PyStructSequence_New(&ThreadInfoType);
@@ -409,43 +216,44 @@ PyThread_GetInfo(void)
         return NULL;
 
     value = PyUnicode_FromString(PYTHREAD_NAME);
-    if (value == NULL) {
-        Py_DECREF(threadinfo);
-        return NULL;
+    if (!value || PyStructSequence_SET_ITEM(threadinfo, pos++, value)) {
+        goto error;
     }
-    PyStructSequence_SET_ITEM(threadinfo, pos++, value);
+    Py_DECREF(value);
 
-#ifdef _POSIX_THREADS
-#ifdef USE_SEMAPHORES
-    value = PyUnicode_FromString("semaphore");
+#ifdef THREAD_LOCK_NAME
+    value = PyUnicode_FromString(THREAD_LOCK_NAME);
 #else
-    value = PyUnicode_FromString("mutex+cond");
-#endif
-    if (value == NULL) {
-        Py_DECREF(threadinfo);
-        return NULL;
-    }
-#else
-    Py_INCREF(Py_None);
     value = Py_None;
 #endif
-    PyStructSequence_SET_ITEM(threadinfo, pos++, value);
+    Py_INCREF(value);
+    if (PyStructSequence_SET_ITEM(threadinfo, pos++, value)) {
+        goto error;
+    }
+    Py_DECREF(value);
 
-#if (defined(_POSIX_THREADS) && defined(HAVE_CONFSTR) \
-     && defined(_CS_GNU_LIBPTHREAD_VERSION))
-    value = NULL;
-    len = confstr(_CS_GNU_LIBPTHREAD_VERSION, buffer, sizeof(buffer));
-    if (1 < len && (size_t)len < sizeof(buffer)) {
-        value = PyUnicode_DecodeFSDefaultAndSize(buffer, len-1);
-        if (value == NULL)
-            PyErr_Clear();
-    }
-    if (value == NULL)
+#ifdef THREAD_VERSION
+    value = PyUnicode_FromString(THREAD_VERSION);
+#else
+    value = Py_None;
 #endif
-    {
-        Py_INCREF(Py_None);
-        value = Py_None;
+    Py_INCREF(value);
+    if (PyStructSequence_SET_ITEM(threadinfo, pos++, value)) {
+        goto error;
     }
-    PyStructSequence_SET_ITEM(threadinfo, pos++, value);
+    Py_DECREF(value);
+
     return threadinfo;
+
+error:
+    Py_CLEAR(threadinfo);
+    return NULL;
+}
+
+
+/* Cleanup TSS keys at runtime finalization */
+void
+_PyThread_Fini(void)
+{
+    /* Platform-specific cleanup if needed */
 }

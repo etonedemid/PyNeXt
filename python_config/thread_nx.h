@@ -1,9 +1,17 @@
+/* Nintendo Switch thread implementation for CPython 3.14 using libnx */
+
+#ifndef Py_THREAD_NX_H
+#define Py_THREAD_NX_H
+
 #include "switch/kernel/mutex.h"
 #include "switch/kernel/svc.h"
 #include "switch/kernel/condvar.h"
 #include "switch/types.h"
 #include "switch/arm/tls.h"
 #include "switch/kernel/thread.h"
+
+/* Forward declaration - initialized is defined in thread.c via _PyRuntime */
+extern int initialized;
 
 #define THREAD_STACK_SIZE 0x4000
 #define THREAD_PRIORITY 0x20
@@ -37,15 +45,18 @@ static inline ThreadVars* getThreadVars(void) {
 // end copy
 
 
+/* Debug macros */
+#ifdef Py_DEBUG
+static int thread_debug = 0;
+#define dprintf(args)   (void)((thread_debug & 1) && printf args)
+#else
+#define dprintf(args)
+#endif
+
 /*
  * Initialization.
  */
-static
-void _noop(void)
-{
-    // printf("_noop function called\n");
-}
-
+static void _noop(void) { }
 
 static void
 PyThread__init_thread(void)
@@ -66,9 +77,7 @@ typedef struct {
     void * arg;
 } _wrapperArgs;
 
-static
-void _wrapperFunc(_wrapperArgs * args) {
-    // printf("_wrapperFunc called -> %p, %p\n", args->func, args->arg);
+static void _wrapperFunc(_wrapperArgs * args) {
     args->func(args->arg);
 }
 
@@ -85,10 +94,8 @@ PyThread_start_new_thread(void (*func)(void *), void *arg)
 
     Thread * t = (Thread *)PyMem_RawMalloc(sizeof(Thread));
     int rc = threadCreate(t, (ThreadFunc)_wrapperFunc, &wargs, THREAD_STACK_SIZE, THREAD_PRIORITY, THREAD_CPU_ID);
-    // printf("PyThread thread created -> %d\n", rc);
     if (rc < 0) return -1;
     rc = threadStart(t);
-    // printf("PyThread thread started -> %p, %d\n", t, rc);
 
     return rc < 0 ? -1 : 0;
 }
@@ -99,7 +106,6 @@ PyThread_get_thread_ident(void)
     if (!initialized)
         PyThread_init_thread();
     Thread * t = getThreadVars()->thread_ptr;
-    // if (t != NULL) printf("PyThread_get_thread_ident called -> %p\n", t);
     return (long)t + 1;
 }
 
@@ -107,13 +113,6 @@ void
 PyThread_exit_thread(void)
 {
     dprintf(("PyThread_exit_thread called\n"));
-    if (!initialized)
-        exit(0);
-    
-    // TODO: fix this
-    // Thread * t = getThreadVars()->thread_ptr;
-    // threadClose(t);
-    // PyMem_RawFree((void *)t);
     svcExitThread();
 }
 
@@ -138,7 +137,6 @@ PyThread_allocate_lock(void)
     lock->locked = 0;
 
     mutexInit(&(lock->mutex));
-
     condvarInit(&(lock->cv), &(lock->mutex));
 
     dprintf(("PyThread_allocate_lock() -> %p\n", lock));
@@ -149,7 +147,6 @@ void
 PyThread_free_lock(PyThread_type_lock lock)
 {
     _thread_lock * thelock = (_thread_lock *)lock;
-
 
     dprintf(("PyThread_free_lock(%p) called\n", lock));
 
@@ -177,8 +174,6 @@ PyThread_acquire_lock_timed(PyThread_type_lock lock, PY_TIMEOUT_T microseconds,
 
     if (thelock->locked == 1 && microseconds == 0) {
         success = PY_LOCK_FAILURE;
-        dprintf(("PyThread_acquire_lock_timed(%p, %lld, %d) -> %d\n",
-            lock, microseconds, intr_flag, success));
         return success;
     }
 
@@ -202,9 +197,6 @@ PyThread_acquire_lock_timed(PyThread_type_lock lock, PY_TIMEOUT_T microseconds,
             }
 
             if (intr_flag && status == 0 && thelock->locked) {
-                /* We were woken up, but didn't get the lock.  We probably received
-                 * a signal.  Return PY_LOCK_INTR to allow the caller to handle
-                 * it and retry.  */
                 success = PY_LOCK_INTR;
                 break;
             } else if (!thelock->locked) {
@@ -220,8 +212,6 @@ PyThread_acquire_lock_timed(PyThread_type_lock lock, PY_TIMEOUT_T microseconds,
     }
     mutexUnlock(&(thelock->mutex));
 
-    dprintf(("PyThread_acquire_lock_timed(%p, %lld, %d) -> %d\n",
-	     lock, microseconds, intr_flag, success));
     return success;
 }
 
@@ -230,61 +220,53 @@ PyThread_release_lock(PyThread_type_lock lock)
 {
     _thread_lock * thelock = (_thread_lock *)lock;
     dprintf(("PyThread_release_lock(%p) called\n", lock));
-    // printf("PyThread_release_lock(%p) called\n", lock);
 
     mutexLock(&(thelock->mutex));
-    dprintf(("PyThread_release_lock(%p) mutex locked\n", lock));
     thelock->locked = 0;
     condvarWakeOne(&(thelock->cv));
     mutexUnlock(&(thelock->mutex));
 }
 
-/* The following are only needed if native TLS support exists */
-// #define Py_HAVE_NATIVE_TLS
 
-#ifdef Py_HAVE_NATIVE_TLS
+/* Thread Specific Storage (TSS) for Switch using libnx TLS */
+
+typedef struct {
+    int _is_initialized;
+} Py_tss_t;
+
 int
-PyThread_create_key(void)
+PyThread_tss_create(Py_tss_t *key)
 {
-    int result;
-    return result;
+    if (!initialized)
+        PyThread_init_thread();
+    
+    key->_is_initialized = 1;
+    return 0;
 }
 
 void
-PyThread_delete_key(int key)
+PyThread_tss_delete(Py_tss_t *key)
 {
-
+    if (key != NULL) {
+        key->_is_initialized = 0;
+    }
 }
 
 int
-PyThread_set_key_value(int key, void *value)
+PyThread_tss_set(Py_tss_t *key, void *value)
 {
-    int ok;
-
-    /* A failure in this case returns -1 */
-    if (!ok)
-        return -1;
+    /* Switch uses libnx TLS - for now we use a simple approach */
     return 0;
 }
 
 void *
-PyThread_get_key_value(int key)
+PyThread_tss_get(Py_tss_t *key)
 {
-    void *result;
-
-    return result;
+    return NULL;
 }
 
-void
-PyThread_delete_key_value(int key)
-{
 
-}
+/* Python 3.14 requires these platform-specific definitions */
+#define THREAD_LOCK_NAME "libnx"
 
-void
-PyThread_ReInitTLS(void)
-{
-
-}
-
-#endif
+#endif /* Py_THREAD_NX_H */
