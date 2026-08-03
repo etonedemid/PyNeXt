@@ -149,9 +149,11 @@ patchPY: cloneNX extractedPY
 	# Patch configure to recognize aarch64-none-elf as Linux-like and allow cross-build
 	cp $(PYDIR)/configure $(PYDIR)/configure_old
 	cat $(PYDIR)/configure_old | \
-		$(SED) 's/\*\-\*linux\*)/\*\-\*linux\*\|aarch64\-none\-elf)/g' | \
 		$(SED) 's/aarch64\-\*\-linux\-gnu\/gcc/aarch64\-\*\-linux\-gnu\/gcc\|aarch64\-none\-elf\/gcc/g' | \
-		$(SED) 's/cross build not supported for \$host/MACHDEP=linux; AC_MSG_RESULT([allowing cross build for $host])/g' > $(PYDIR)/configure
+		$(SED) '/\t\*\-\*linux\*)/i\
+\t\taarch64-none-elf)\
+\t\t\tac_sys_system=Linux\
+\t\t\t;;' > $(PYDIR)/configure
 	
 	# Create config.site to override auto-detection for missing features
 	echo ac_cv_file__dev_ptmx=no > $(PYDIR)/config.site
