@@ -1,142 +1,113 @@
-import imgui
-import imguihelper
-import os
-import _nx
-import runpy
 import sys
-import time
-from imgui.integrations.nx import NXRenderer
-from nx.utils import clear_terminal, Terminal
-import traceback
+import _pynx
 
-sys.argv = [""]  # workaround needed for runpy
+PI = 3.14159265358979323846
+TWO_PI = 2 * PI
 
-def colorToFloat(t):
-    nt = ()
-    for v in t:
-        nt += ((1/255) * v, )
-    return nt
 
-# (r, g, b)
-FOLDER_COLOR = colorToFloat((230, 126, 34))
-PYFILE_COLOR = colorToFloat((46, 204, 113))
-FILE_COLOR = colorToFloat((41, 128, 185))
-APP_COLOR = colorToFloat((24, 86, 31))
+def _sin_taylor(x):
+    # Taylor series for sin, x assumed already reduced to [-pi, pi]
+    x2 = x * x
+    term = x
+    total = x
+    # a few terms give plenty of precision for |x| <= pi
+    for n in range(1, 10):
+        term *= -x2 / ((2 * n) * (2 * n + 1))
+        total += term
+    return total
 
-ERROR = ""
 
-TILED_DOUBLE = 1
-def run_python_module(path: str):
-    global ERROR
-    # clear both buffers
-    imguihelper.clear()
-    imguihelper.clear()
-    _nx.gfx_set_mode(TILED_DOUBLE)
-    clear_terminal()
-    try:
-        runpy.run_path(path, run_name='__main__')
-    except Exception as e:
-        ERROR = traceback.format_exc()
-    imguihelper.initialize()
+def my_sin(x):
+    # reduce x into [-pi, pi]
+    x = x % TWO_PI
+    if x > PI:
+        x -= TWO_PI
+    return _sin_taylor(x)
+
+
+def my_cos(x):
+    return my_sin(x + PI / 2)
+
+
+def render_frame(A, B):
+    # 80x22 resolution for Switch console
+    output = [' '] * (80 * 22)
+    zbuffer = [0] * (80 * 22)
+
+    cos_A, sin_A = my_cos(A), my_sin(A)
+    cos_B, sin_B = my_cos(B), my_sin(B)
+
+    # theta: donut cross-section
+    for j in range(0, 628, 7):
+        theta = j / 100
+        cos_theta, sin_theta = my_cos(theta), my_sin(theta)
+
+        # phi: donut center rotation
+        for i in range(0, 628, 2):
+            phi = i / 100
+            cos_phi, sin_phi = my_cos(phi), my_sin(phi)
+
+            circle_x = cos_theta + 2
+            circle_y = sin_theta
+
+            x = circle_x * (cos_B * cos_phi + sin_A * sin_B * sin_phi) - circle_y * cos_A * sin_B
+            y = circle_x * (sin_B * cos_phi - sin_A * cos_B * sin_phi) + circle_y * cos_A * cos_B
+            z = 5 + cos_A * circle_x * sin_phi + circle_y * sin_A
+            ooz = 1 / z
+
+            K1 = 30
+            xp = int(40 + K1 * ooz * x)
+            yp = int(12 - K1 * ooz * y * 0.5)
+
+            if 0 <= xp < 80 and 0 <= yp < 22:
+                idx = xp + 80 * yp
+                luminance = (cos_phi * cos_theta * sin_B
+                             - cos_A * cos_theta * sin_phi
+                             - sin_A * sin_theta
+                             + cos_B * (cos_A * sin_theta - cos_theta * sin_A * sin_phi))
+
+                if ooz > zbuffer[idx] and luminance > 0:
+                    zbuffer[idx] = ooz
+                    luminance_index = int(luminance * 8)
+                    output[idx] = ".,-~:;=!*#$@"[max(0, min(11, luminance_index))]
+
+    return output
 
 
 def main():
-    global ERROR
-    renderer = NXRenderer()
-    currentDir = os.getcwd()
+    A, B = 1.0, 1.0
+    print("Initializing Donut...")
+    try:
+        while True:
+            frame = render_frame(A, B)
 
-    while True:
-        renderer.handleinputs()
+            # Clear screen and cursor to top-left
+            sys.stdout.write('\033[H')
 
-        imgui.new_frame()
+            output_str = []
+            for row in range(22):
+                output_str.append(''.join(frame[row * 80:(row + 1) * 80]))
 
-        width, height = renderer.io.display_size
-        imgui.set_next_window_size(width, height)
-        imgui.set_next_window_position(0, 0)
-        imgui.begin("", 
-            flags=imgui.WINDOW_NO_TITLE_BAR | imgui.WINDOW_NO_RESIZE | imgui.WINDOW_NO_MOVE | imgui.WINDOW_NO_SAVED_SETTINGS
-        )
-        imgui.begin_group()
+            print('\n'.join(output_str))
+            print("\nDon't forget to pay respects to uncle Sonic! Sony just doesn't get it.")
+            print("Python version:", sys.version)
 
-        imgui.text("Welcome to PyNX!")
-        imgui.text("Touch is supported")
-        imgui.text("Current dir: " + os.getcwd())
+            A += 0.08
+            B += 0.03
 
-        if os.getcwd() != "sdmc:/":
-            imgui.push_style_color(imgui.COLOR_BUTTON, *FOLDER_COLOR)
-            if imgui.button("../", width=200, height=60):
-                os.chdir("..")
-            imgui.pop_style_color(1)
-        
-        dirs = []
-        files = []
-        for e in os.listdir():
-            if os.path.isdir(e):
-                dirs.append(e)
-            else:
-                files.append(e)
-        
-        dirs = sorted(dirs)
-        files = sorted(files)
+            # Flush and push framebuffer to screen
+            _pynx.flush_console()
+            _pynx.console_update()
 
-        for e in dirs:
-            imgui.push_style_color(imgui.COLOR_BUTTON, *FOLDER_COLOR)
-            if imgui.button(e + "/", width=200, height=60):
-                os.chdir(e)
-            imgui.pop_style_color(1)
+            # Check if Plus button was pressed
+            if _pynx.should_quit():
+                break
 
-        for e in files:
-            if e.endswith(".py"):
-                imgui.push_style_color(imgui.COLOR_BUTTON, *PYFILE_COLOR)
-            else:
-                imgui.push_style_color(imgui.COLOR_BUTTON, *FILE_COLOR)
-
-            if imgui.button(e, width=200, height=60) and e.endswith(".py"):
-                run_python_module(e)
-            
-            imgui.pop_style_color(1)
-        
-        imgui.end_group()
-        # end of file picker
-
-        imgui.same_line(spacing=50)
-        imgui.begin_group()
-        imgui.text("Utils:")
-
-        imgui.push_style_color(imgui.COLOR_BUTTON, *APP_COLOR)
-        if imgui.button("Interactive Python", width=200, height=60):
-            t = Terminal()
-            t.main()
-        imgui.pop_style_color(1)
-
-        imgui.end_group()
-
-        
-        imgui.end()
-
-        if ERROR:
-            imgui.set_next_window_size(width, height)
-            imgui.set_next_window_position(0, 0)
-            imgui.begin("ERROR", 
-                flags=imgui.WINDOW_NO_RESIZE | imgui.WINDOW_NO_MOVE | imgui.WINDOW_NO_SAVED_SETTINGS
-            )
-            imgui.text(str(ERROR))
-            if imgui.button("OK", width=200, height=60):
-                ERROR = ""
-            imgui.end()
-
-        imgui.render()
-        renderer.render()
-
-    renderer.shutdown()
+            # Sleep using svcSleepThread (time.sleep can crash on Switch)
+            _pynx.sleep_ms(33)
+    except KeyboardInterrupt:
+        print("\nBye")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception:
-        imguihelper.clear()
-        imguihelper.clear()
-        _nx.gfx_set_mode(TILED_DOUBLE)
-        clear_terminal()
-        traceback.print_exc()
+    main()

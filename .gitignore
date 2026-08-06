@@ -1,4 +1,50 @@
-python_build/*
-!python_build/Makefile
+# Build artifacts
 build/
-PyNX.*
+PyNeXt.elf
+PyNeXt.nro
+PyNeXt.nso
+PyNeXt.pfs0
+PyNeXt.nacp
+
+# Python build (keep build config, ignore compiled output)
+python_build/nxpy3.14.6/
+python_build/Python-3.14.6/
+python_build/dist/
+python_build/python.zip
+python_build/.python-config
+python_build/.python-version
+python_build/distfPY
+
+# Source build intermediates
+switch_pynx.specs
+switch_stubs.o
+
+# Debug / helper scripts (not part of the project)
+_addr2line.sh
+_addr2line_debug.sh
+_addr2line_debug2.sh
+_build_deploy.ps1
+_build_script.sh
+_crash_map.txt
+_dbg_callers.txt
+_dbg_out.txt
+_find_callers.sh
+_fix_and_build.sh
+_sync_and_build.ps1
+build_and_deploy.ps1
+build_and_deploy.sh
+deploy_to_sd.ps1
+grep
+write_stubs_wsl.py
+write_switch_stubs.py
+setup_and_build.sh
+build_pynx.ps1
+
+# Source intermediates
+source/*.o
+source/*.d
+
+# IDE / OS
+.DS_Store
+Thumbs.db
+*.log
